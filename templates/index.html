@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Virtual Dressing Room</title>
+</head>
+<body>
+    <h1>Virtual Dressing Room</h1>
+    <form action="/upload" method="post" enctype="multipart/form-data">
+        <label for="image">Upload Image:</label>
+        <input type="file" name="image" accept="image/*">
+        <input type="submit" value="Generate Outfit">
+    </form>
+
+    {% if result_image %}
+    <h2>Generated Output:</h2>
+    <img src="{{ result_image }}" alt="Generated Output Image">
+    {% endif %}
+</body>
+</html>
