@@ -1,4 +1,5 @@
 import json
+import os
 from os import path as osp
 
 import numpy as np
@@ -20,6 +21,15 @@ class VITONDataset(data.Dataset):
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
 
+        # resolve sub-directories that may have naming differences
+        self.subdirs = {}
+        self.subdirs['cloth'] = self._resolve_subdir('cloth', ['cloth'])
+        self.subdirs['cloth_mask'] = self._resolve_subdir('cloth-mask', ['cloth-mask', 'cloth_mask'])
+        self.subdirs['image'] = self._resolve_subdir('image', ['image'])
+        self.subdirs['image_parse'] = self._resolve_subdir('image-parse', ['image-parse', 'image-parse-v3'])
+        self.subdirs['openpose_img'] = self._resolve_subdir('openpose-img', ['openpose-img', 'openpose_img'])
+        self.subdirs['openpose_json'] = self._resolve_subdir('openpose-json', ['openpose-json', 'openpose_json'])
+
         # load data list
         img_names = []
         c_names = []
@@ -32,6 +42,15 @@ class VITONDataset(data.Dataset):
         self.img_names = img_names
         self.c_names = dict()
         self.c_names['unpaired'] = c_names
+
+    def _resolve_subdir(self, preferred, alternatives):
+        candidates = [preferred] + alternatives
+        for name in candidates:
+            candidate_path = osp.join(self.data_path, name)
+            if osp.isdir(candidate_path):
+                return name
+        # fall back to preferred even if missing to surface clearer downstream error
+        return preferred
 
     def get_parse_agnostic(self, parse, pose_data):
         parse_array = np.array(parse)
@@ -122,25 +141,37 @@ class VITONDataset(data.Dataset):
         cm = {}
         for key in self.c_names:
             c_name[key] = self.c_names[key][index]
-            c[key] = Image.open(osp.join(self.data_path, 'cloth', c_name[key])).convert('RGB')
-            c[key] = transforms.Resize(self.load_width, interpolation=2)(c[key])
-            cm[key] = Image.open(osp.join(self.data_path, 'cloth-mask', c_name[key]))
-            cm[key] = transforms.Resize(self.load_width, interpolation=0)(cm[key])
+            c[key] = Image.open(osp.join(self.data_path, self.subdirs['cloth'], c_name[key])).convert('RGB')
+            c[key] = transforms.Resize((self.load_height, self.load_width), interpolation=Image.BICUBIC)(c[key])
+            cm[key] = Image.open(osp.join(self.data_path, self.subdirs['cloth_mask'], c_name[key]))
+            cm[key] = transforms.Resize((self.load_height, self.load_width), interpolation=Image.NEAREST)(cm[key])
 
-            c[key] = self.transform(c[key])  # [-1,1]
+            try:
+                c[key] = self.transform(c[key])  # [-1,1]
+            except TypeError:
+                np_img = np.asarray(c[key], dtype=np.float32) / 255.0
+                np_img = np.clip(np_img, 0.0, 1.0)
+                tensor = torch.tensor(np_img.transpose(2, 0, 1), dtype=torch.float32)
+                c[key] = (tensor - 0.5) / 0.5
             cm_array = np.array(cm[key])
             cm_array = (cm_array >= 128).astype(np.float32)
-            cm[key] = torch.from_numpy(cm_array)  # [0,1]
+            cm[key] = torch.tensor(cm_array, dtype=torch.float32)  # [0,1]
             cm[key].unsqueeze_(0)
 
         # load pose image
         pose_name = img_name.replace('.jpg', '_rendered.png')
-        pose_rgb = Image.open(osp.join(self.data_path, 'openpose-img', pose_name))
-        pose_rgb = transforms.Resize(self.load_width, interpolation=2)(pose_rgb)
-        pose_rgb = self.transform(pose_rgb)  # [-1,1]
+        pose_rgb = Image.open(osp.join(self.data_path, self.subdirs['openpose_img'], pose_name))
+        pose_rgb = transforms.Resize((self.load_height, self.load_width), interpolation=Image.BICUBIC)(pose_rgb)
+        try:
+            pose_rgb = self.transform(pose_rgb)  # [-1,1]
+        except TypeError:
+            np_pose = np.asarray(pose_rgb, dtype=np.float32) / 255.0
+            np_pose = np.clip(np_pose, 0.0, 1.0)
+            tensor = torch.tensor(np_pose.transpose(2, 0, 1), dtype=torch.float32)
+            pose_rgb = (tensor - 0.5) / 0.5
 
         pose_name = img_name.replace('.jpg', '_keypoints.json')
-        with open(osp.join(self.data_path, 'openpose-json', pose_name), 'r') as f:
+        with open(osp.join(self.data_path, self.subdirs['openpose_json'], pose_name), 'r') as f:
             pose_label = json.load(f)
             pose_data = pose_label['people'][0]['pose_keypoints_2d']
             pose_data = np.array(pose_data)
@@ -148,10 +179,11 @@ class VITONDataset(data.Dataset):
 
         # load parsing image
         parse_name = img_name.replace('.jpg', '.png')
-        parse = Image.open(osp.join(self.data_path, 'image-parse', parse_name))
-        parse = transforms.Resize(self.load_width, interpolation=0)(parse)
+        parse = Image.open(osp.join(self.data_path, self.subdirs['image_parse'], parse_name))
+        parse = transforms.Resize((self.load_height, self.load_width), interpolation=Image.NEAREST)(parse)
         parse_agnostic = self.get_parse_agnostic(parse, pose_data)
-        parse_agnostic = torch.from_numpy(np.array(parse_agnostic)[None]).long()
+        parse_np = np.array(parse_agnostic, dtype=np.int64)[None]
+        parse_agnostic = torch.tensor(parse_np, dtype=torch.long)
 
         labels = {
             0: ['background', [0, 10]],
@@ -176,11 +208,23 @@ class VITONDataset(data.Dataset):
                 new_parse_agnostic_map[i] += parse_agnostic_map[label]
 
         # load person image
-        img = Image.open(osp.join(self.data_path, 'image', img_name))
-        img = transforms.Resize(self.load_width, interpolation=2)(img)
+        img = Image.open(osp.join(self.data_path, self.subdirs['image'], img_name))
+        img = transforms.Resize((self.load_height, self.load_width), interpolation=Image.BICUBIC)(img)
         img_agnostic = self.get_img_agnostic(img, parse, pose_data)
-        img = self.transform(img)
-        img_agnostic = self.transform(img_agnostic)  # [-1,1]
+        try:
+            img = self.transform(img)
+        except TypeError:
+            np_img = np.asarray(img, dtype=np.float32) / 255.0
+            np_img = np.clip(np_img, 0.0, 1.0)
+            tensor = torch.tensor(np_img.transpose(2, 0, 1), dtype=torch.float32)
+            img = (tensor - 0.5) / 0.5
+        try:
+            img_agnostic = self.transform(img_agnostic)  # [-1,1]
+        except TypeError:
+            np_img = np.asarray(img_agnostic, dtype=np.float32) / 255.0
+            np_img = np.clip(np_img, 0.0, 1.0)
+            tensor = torch.tensor(np_img.transpose(2, 0, 1), dtype=torch.float32)
+            img_agnostic = (tensor - 0.5) / 0.5
 
         result = {
             'img_name': img_name,

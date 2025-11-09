@@ -5,13 +5,11 @@ from PIL import Image
 import torch
 
 
-def gen_noise(shape):
-    noise = np.zeros(shape, dtype=np.uint8)
-    ### noise
-    noise = cv2.randn(noise, 0, 255)
-    noise = np.asarray(noise / 255, dtype=np.uint8)
-    noise = torch.tensor(noise, dtype=torch.float32)
-    return noise
+def gen_noise(size):
+    if isinstance(size, torch.Size):
+        size = tuple(size)
+    noise = np.random.randn(*size).astype(np.float32)
+    return torch.tensor(noise, dtype=torch.float32)
 
 
 def save_images(img_tensors, img_names, save_dir):
@@ -38,7 +36,7 @@ def load_checkpoint(model, checkpoint_path, map_location='cpu'):
     if not os.path.exists(checkpoint_path):
         raise ValueError(f"'{checkpoint_path}' is not a valid checkpoint path")
 
-    print(f"🔄 Loading checkpoint from: {checkpoint_path}")
+    print(f"[info] Loading checkpoint from: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=map_location)
 
     # Handle possible checkpoint formats
@@ -55,7 +53,7 @@ def load_checkpoint(model, checkpoint_path, map_location='cpu'):
 
     # Load weights
     model.load_state_dict(state_dict, strict=False)
-    print("✅ Model weights loaded successfully.")
+    print("[info] Model weights loaded successfully.")
 
     # Return entire checkpoint if it includes optimizer/epoch etc.
     return checkpoint
@@ -70,4 +68,4 @@ def save_checkpoint(model, optimizer=None, epoch=None, path='checkpoint.pth'):
         checkpoint['epoch'] = epoch
 
     torch.save(checkpoint, path)
-    print(f"💾 Checkpoint saved to {path}")
+    print(f"[info] Checkpoint saved to {path}")
