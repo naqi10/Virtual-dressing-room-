@@ -1,0 +1,31 @@
+# Core deep learning & vision libraries
+torch==2.4.1
+torchvision==0.19.1
+torchaudio==2.4.1
+
+# Image & data processing
+numpy==1.26.4
+opencv-python==4.10.0.84
+Pillow==10.4.0
+scipy==1.13.1
+
+# Flask web backend
+Flask==3.0.3
+Werkzeug==3.0.3
+Jinja2==3.1.4
+
+# Pose estimation / human parsing
+mediapipe==0.10.14
+# openpifpaf==0.13.11   # optional, uncomment if you want OpenPifPaf
+
+# Utilities
+requests==2.32.3
+tqdm==4.66.5
+matplotlib==3.9.2
+imageio==2.36.0
+scikit-image==0.24.0
+
+# Optional helpers for file ops, safety, etc.
+psutil==6.1.0
+uuid==1.30
+torchgeometry
