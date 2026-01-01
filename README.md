@@ -209,7 +209,7 @@ This project is intended for **educational and research purposes only**. All dat
 
 ## Author
 
-**Naqi Zaidi**
+**Ali Naqi**
 AI & Data Science Practitioner
 
 ---
