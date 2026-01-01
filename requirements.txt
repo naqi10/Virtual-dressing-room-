@@ -29,3 +29,11 @@ scikit-image==0.24.0
 psutil==6.1.0
 uuid==1.30
 torchgeometry
+
+# KlingAI try-on API
+# Note: The 'tryon' package is optional. If not available, a direct API implementation will be used.
+# If you have the tryon package, install it manually
+# python-dotenv is required for loading .env file
+python-dotenv
+# PyJWT is required for KlingAI JWT token generation
+PyJWT

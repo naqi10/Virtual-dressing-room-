@@ -10,10 +10,507 @@ import traceback
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageOps, ImageFilter
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for, Response
 import numpy as np
+import cv2
 from torchvision import transforms as T
 from werkzeug.utils import secure_filename
+
+# Load environment variables for API keys
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+# KlingAI try-on adapter
+try:
+    from tryon.api import KlingAIVTONAdapter  # type: ignore
+    KLINGAI_AVAILABLE = True
+    print("[info] Using tryon package for KlingAI integration")
+except ImportError:
+    # Fallback: Create a simple KlingAI adapter using direct API calls
+    print("[WARNING] tryon package not found. Using direct API implementation.")
+    
+    class KlingAIVTONAdapter:
+        """Simple KlingAI VTON adapter using direct API calls."""
+        def __init__(self, api_key=None, secret_key=None, base_url=None):
+            # Read from environment variables if not provided (matching original API behavior)
+            # Support both naming conventions: KLINGAI_* and KLING_AI_*
+            self.api_key = api_key or os.getenv("KLINGAI_API_KEY") or os.getenv("KLING_AI_API_KEY", "")
+            self.secret_key = secret_key or os.getenv("KLINGAI_SECRET_KEY") or os.getenv("KLING_AI_SECRET_KEY", "")
+            # Default base URL according to GitHub README: api-singapore.klingai.com
+            self.base_url = (base_url or os.getenv("KLINGAI_BASE_URL") or os.getenv("KLING_AI_BASE_URL", "https://api-singapore.klingai.com")).rstrip('/')
+            
+            if not self.api_key or not self.secret_key:
+                raise ValueError("API key and secret key are required. Set KLINGAI_API_KEY/KLING_AI_API_KEY and KLINGAI_SECRET_KEY/KLING_AI_SECRET_KEY environment variables or pass them as parameters.")
+            
+            # Debug: Verify keys are loaded
+            if not self.api_key.strip() or not self.secret_key.strip():
+                raise ValueError("API key or secret key is empty after loading from environment variables. Please check your .env file.")
+        
+        def generate_and_decode(self, source_image, reference_image, model="kolors-virtual-try-on-v1-5"):
+            """
+            Generate try-on images using KlingAI API.
+            
+            Args:
+                source_image: Path to person image
+                reference_image: Path to clothing image
+                model: Model name - supports:
+                    - "kolors-virtual-try-on-v1" (Original model version)
+                    - "kolors-virtual-try-on-v1-5" (Enhanced version - default)
+            
+            Returns:
+                List of PIL Image objects
+            """
+            # Validate model version
+            valid_models = ["kolors-virtual-try-on-v1", "kolors-virtual-try-on-v1-5"]
+            if model not in valid_models:
+                print(f"[WARNING] Invalid model '{model}', using default 'kolors-virtual-try-on-v1-5'")
+                model = "kolors-virtual-try-on-v1-5"
+            import requests
+            import base64
+            from io import BytesIO
+            import time
+            
+            # Correct endpoint according to KlingAI documentation
+            # POST /v1/images/kolors-virtual-try-on
+            url = f"{self.base_url}/v1/images/kolors-virtual-try-on"
+            
+            # Read and encode images as base64 (without data: prefix)
+            with open(source_image, 'rb') as f:
+                source_data = base64.b64encode(f.read()).decode('utf-8')
+            
+            with open(reference_image, 'rb') as f:
+                reference_data = base64.b64encode(f.read()).decode('utf-8')
+            
+            # Request body according to KlingAI documentation
+            # Field names: human_image, cloth_image, model_name (not source_image, reference_image, model)
+            payload = {
+                "human_image": source_data,  # Base64 encoded, no data: prefix
+                "cloth_image": reference_data,  # Base64 encoded, no data: prefix
+                "model_name": model  # e.g., "kolors-virtual-try-on-v1-5"
+            }
+            
+            # Request headers according to KlingAI documentation
+            # KlingAI uses JWT (JSON Web Token) authentication
+            # Step 1: Generate JWT token using AccessKey and SecretKey
+            # Step 2: Use token in Authorization header as "Bearer {jwt_token}"
+            import time
+            import json
+            
+            # Try to import PyJWT for JWT token generation
+            try:
+                import jwt
+                jwt_available = True
+            except ImportError:
+                jwt_available = False
+                print("[WARNING] PyJWT not installed. Install it with: pip install PyJWT")
+                print("[WARNING] Falling back to direct API key (may not work)")
+            
+            # Generate JWT token according to KlingAI documentation
+            if jwt_available:
+                try:
+                    headers_jwt = {
+                        "alg": "HS256",
+                        "typ": "JWT"
+                    }
+                    current_time = int(time.time())
+                    payload_jwt = {
+                        "iss": self.api_key,  # AccessKey (API Key) as issuer
+                        "exp": current_time + 1800,  # Valid for 30 minutes (1800 seconds)
+                        "nbf": current_time - 5  # Starts 5 seconds ago
+                    }
+                    # Generate JWT token: sign with secret_key using HS256 algorithm
+                    # Note: jwt.encode returns a string (not bytes) in newer versions
+                    jwt_token = jwt.encode(payload_jwt, self.secret_key, algorithm="HS256", headers=headers_jwt)
+                    
+                    # Ensure token is a string (not bytes)
+                    if isinstance(jwt_token, bytes):
+                        jwt_token = jwt_token.decode('utf-8')
+                    
+                    # Print token for verification on KlingAI website
+                    print(f"[info] Generated JWT token for authentication")
+                    print(f"[DEBUG] JWT Token (for verification on KlingAI website):")
+                    print(f"[DEBUG] {jwt_token}")
+                    print(f"[DEBUG] Copy this token and verify it at: https://klingai.com (JWT Verification section)")
+                    
+                    # Use the generated JWT token in Authorization header
+                    headers = {
+                        "Authorization": f"Bearer {jwt_token}",
+                        "Content-Type": "application/json"
+                    }
+                except Exception as e:
+                    print(f"[ERROR] Failed to generate JWT token: {e}")
+                    import traceback
+                    print(f"[ERROR] Traceback: {traceback.format_exc()}")
+                    # Fallback to direct API key (unlikely to work, but try anyway)
+                    headers = {
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json"
+                    }
+            else:
+                # Fallback if PyJWT is not available
+                headers = {
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                }
+            
+            # Only one authentication method needed (JWT)
+            headers_options = [headers]
+            
+            # Debug: Print authentication info (without exposing full keys)
+            print(f"[DEBUG] API Key (first 8 chars): {self.api_key[:8]}...")
+            print(f"[DEBUG] Secret Key (first 8 chars): {self.secret_key[:8]}...")
+            print(f"[DEBUG] Base URL: {self.base_url}")
+            
+            # Make API request
+            response = None
+            last_error = None
+            
+            for idx, headers in enumerate(headers_options):
+                try:
+                    # Debug: Show which auth method we're trying (without exposing keys)
+                    auth_type = headers.get("Authorization", "None")
+                    if auth_type.startswith("Bearer "):
+                        auth_display = f"Bearer {auth_type[7:15]}..."
+                    elif auth_type.startswith("Basic "):
+                        auth_display = "Basic [encoded]"
+                    elif auth_type.startswith("ApiKey "):
+                        auth_display = f"ApiKey {auth_type[7:15]}..."
+                    else:
+                        auth_display = f"Direct {auth_type[:8]}..."
+                    
+                    print(f"[DEBUG] Trying authentication method {idx + 1}/{len(headers_options)}: {auth_display}")
+                    print(f"[info] Sending request to: {url}")
+                    print(f"[info] Using model: {model}")
+                    
+                    # Verify Authorization header is set
+                    if "Authorization" not in headers or not headers["Authorization"]:
+                        print(f"[ERROR] Authorization header is missing or empty!")
+                        continue
+                    
+                    response = requests.post(url, json=payload, headers=headers, timeout=300)
+                    
+                    if response.status_code == 200:
+                        print(f"[info] Successfully connected to KlingAI API with auth method {idx + 1}")
+                        break
+                    elif response.status_code == 202:
+                        # API might return 202 Accepted for async processing
+                        print(f"[info] Request accepted (202), checking response...")
+                        result_data = response.json()
+                        if 'task_id' in result_data or 'id' in result_data:
+                            # Need to poll for result
+                            task_id = result_data.get('task_id') or result_data.get('id')
+                            print(f"[info] Task ID: {task_id}, polling for result...")
+                            # Poll for result
+                            poll_url = f"{self.base_url}/v1/images/kolors-virtual-try-on/{task_id}"
+                            max_polls = 60  # Poll for up to 5 minutes (5 second intervals)
+                            for poll_count in range(max_polls):
+                                time.sleep(5)
+                                poll_response = requests.get(poll_url, headers=headers, timeout=30)
+                                if poll_response.status_code == 200:
+                                    result = poll_response.json()
+                                    if result.get('status') == 'completed' or 'image' in result or 'images' in result:
+                                        response = poll_response
+                                        print(f"[info] Task completed after {poll_count * 5} seconds")
+                                        break
+                                    elif result.get('status') == 'failed':
+                                        raise ValueError(f"Task failed: {result.get('message', 'Unknown error')}")
+                                elif poll_response.status_code != 202:
+                                    break
+                            if response and response.status_code == 200:
+                                break
+                    elif response.status_code == 401:
+                        # 401 means auth format is wrong, try next method
+                        error_data = response.json() if response.text else {}
+                        print(f"[DEBUG] Auth failed (401) - trying next method. Error: {error_data.get('message', response.text[:200])}")
+                        last_error = f"Status {response.status_code}: {error_data.get('message', response.text[:300])}"
+                    else:
+                        print(f"[WARNING] Status {response.status_code}: {response.text[:300]}")
+                        last_error = f"Status {response.status_code}: {response.text[:300]}"
+                except requests.exceptions.RequestException as e:
+                    last_error = str(e)
+                    continue
+            
+            if not response or response.status_code not in [200, 202]:
+                error_msg = f"Failed to connect to KlingAI API.\n"
+                error_msg += f"Endpoint: {url}\n"
+                if last_error:
+                    error_msg += f"Error: {last_error}\n"
+                if response:
+                    error_msg += f"Response status: {response.status_code}\n"
+                    error_msg += f"Response: {response.text[:500]}"
+                raise ValueError(error_msg)
+            
+            # Get result JSON
+            result = response.json()
+            
+            # Check if response contains a task_id (async processing)
+            # KlingAI API returns: {'code': 0, 'message': 'SUCCEED', 'data': {'task_id': '...', 'task_status': 'submitted'}}
+            task_id = None
+            task_status = None
+            
+            # Check for task_id in various possible locations
+            if 'data' in result and isinstance(result['data'], dict):
+                task_id = result['data'].get('task_id') or result['data'].get('id')
+                task_status = result['data'].get('task_status') or result['data'].get('status')
+            elif 'task_id' in result:
+                task_id = result.get('task_id') or result.get('id')
+                task_status = result.get('task_status') or result.get('status')
+            
+            # If we have a task_id, we need to poll for the result
+            if task_id:
+                print(f"[info] Task ID received: {task_id}, status: {task_status}")
+                print(f"[info] Polling for task completion...")
+                
+                # Poll for the result
+                poll_url = f"{self.base_url}/v1/images/kolors-virtual-try-on/{task_id}"
+                max_polls = 180  # Poll for up to 15 minutes
+                poll_interval = 3  # Wait 3 seconds between polls (faster checking)
+                
+                for poll_count in range(max_polls):
+                    time.sleep(poll_interval)
+                    try:
+                        poll_response = requests.get(poll_url, headers=headers_options[0], timeout=30)
+                        if poll_response.status_code == 200:
+                            poll_result = poll_response.json()
+                            
+                            # Check task status in the response
+                            poll_task_status = None
+                            poll_data = poll_result.get('data', {}) if isinstance(poll_result.get('data'), dict) else {}
+                            
+                            if isinstance(poll_data, dict):
+                                poll_task_status = poll_data.get('task_status') or poll_data.get('status')
+                            else:
+                                poll_task_status = poll_result.get('task_status') or poll_result.get('status')
+                            
+                            # Normalize status (lowercase, strip whitespace)
+                            if poll_task_status:
+                                poll_task_status = str(poll_task_status).lower().strip()
+                            
+                            print(f"[info] Poll {poll_count + 1}/{max_polls}: Task status = {poll_task_status}")
+                            
+                            # Check if task is completed (KlingAI uses 'succeed' as completion status)
+                            completed_statuses = ['completed', 'success', 'succeeded', 'succeed', 'done', 'finished']
+                            if poll_task_status and poll_task_status in completed_statuses:
+                                print(f"[info] Task completed after {(poll_count + 1) * poll_interval} seconds")
+                                result = poll_result
+                                break
+                            elif poll_task_status in ['failed', 'error']:
+                                error_msg = poll_data.get('message') or poll_result.get('message') or 'Task failed'
+                                raise ValueError(f"Task failed: {error_msg}")
+                            # If status is still 'submitted', 'processing', 'pending', etc., continue polling
+                        elif poll_response.status_code == 404:
+                            print(f"[WARNING] Task not found (404), may have been deleted or invalid task_id")
+                            break
+                        else:
+                            print(f"[WARNING] Poll request returned status {poll_response.status_code}: {poll_response.text[:200]}")
+                    except requests.exceptions.RequestException as e:
+                        print(f"[WARNING] Poll request failed: {e}, continuing...")
+                        continue
+                else:
+                    # If we exhausted all polls without completion
+                    print(f"[WARNING] Polling timeout after {max_polls * poll_interval} seconds")
+                    # Try to use the last poll result anyway
+                    if 'poll_result' in locals():
+                        result = poll_result
+            
+            # Decode images from response
+            # KlingAI API response format may vary, try multiple possible formats
+            images = []
+            
+            # Try different response field names
+            image_fields = ['images', 'image', 'result', 'output', 'output_image', 'result_image']
+            
+            # First, check if images are in the 'data' field
+            if 'data' in result:
+                data_field = result['data']
+                if isinstance(data_field, dict):
+                    # Check for task_result.images structure (KlingAI specific format)
+                    if 'task_result' in data_field and isinstance(data_field['task_result'], dict):
+                        task_result = data_field['task_result']
+                        print(f"[info] Found task_result, keys: {list(task_result.keys())}")
+                        if 'images' in task_result and isinstance(task_result['images'], list):
+                            print(f"[info] Found {len(task_result['images'])} images in data.task_result.images")
+                            for idx, img_item in enumerate(task_result['images']):
+                                print(f"[info] Processing image {idx + 1}, type: {type(img_item)}")
+                                if isinstance(img_item, dict):
+                                    # Check for URL in the image item
+                                    if 'url' in img_item:
+                                        try:
+                                            print(f"[info] Downloading image from URL: {img_item['url'][:100]}...")
+                                            img_response = requests.get(img_item['url'], timeout=60)
+                                            img_response.raise_for_status()
+                                            img = Image.open(BytesIO(img_response.content))
+                                            images.append(img)
+                                            print(f"[info] Successfully downloaded image")
+                                        except Exception as e:
+                                            print(f"[WARNING] Failed to download image from URL: {e}")
+                                    # Check for base64 data
+                                    elif 'data' in img_item:
+                                        try:
+                                            img_bytes = base64.b64decode(img_item['data'])
+                                            img = Image.open(BytesIO(img_bytes))
+                                            images.append(img)
+                                        except Exception as e:
+                                            print(f"[WARNING] Failed to decode image data: {e}")
+                                    elif 'image' in img_item:
+                                        try:
+                                            img_str = img_item['image']
+                                            img_bytes = base64.b64decode(img_str)
+                                            img = Image.open(BytesIO(img_bytes))
+                                            images.append(img)
+                                        except Exception as e:
+                                            print(f"[WARNING] Failed to decode image from nested field: {e}")
+                                elif isinstance(img_item, str):
+                                    # Base64 encoded image string
+                                    try:
+                                        img_bytes = base64.b64decode(img_item)
+                                        img = Image.open(BytesIO(img_bytes))
+                                        images.append(img)
+                                    except Exception as e:
+                                        print(f"[WARNING] Failed to decode image string: {e}")
+                    
+                    # Check for images in data field (other formats)
+                    for field in image_fields:
+                        if field in data_field:
+                            img_data = data_field[field]
+                            
+                            # Handle list of images
+                            if isinstance(img_data, list):
+                                for item in img_data:
+                                    if isinstance(item, str):
+                                        # Base64 encoded image string
+                                        try:
+                                            img_bytes = base64.b64decode(item)
+                                            img = Image.open(BytesIO(img_bytes))
+                                            images.append(img)
+                                        except Exception as e:
+                                            print(f"[WARNING] Failed to decode image from data.{field}: {e}")
+                                    elif isinstance(item, dict) and 'url' in item:
+                                        # Image URL
+                                        try:
+                                            img_response = requests.get(item['url'], timeout=30)
+                                            img = Image.open(BytesIO(img_response.content))
+                                            images.append(img)
+                                        except Exception as e:
+                                            print(f"[WARNING] Failed to download image from URL: {e}")
+                                    elif isinstance(item, dict) and 'image' in item:
+                                        # Nested image field
+                                        img_str = item['image']
+                                        try:
+                                            img_bytes = base64.b64decode(img_str)
+                                            img = Image.open(BytesIO(img_bytes))
+                                            images.append(img)
+                                        except Exception as e:
+                                            print(f"[WARNING] Failed to decode nested image: {e}")
+                            
+                            # Handle single image (string or dict)
+                            elif isinstance(img_data, str):
+                                # Base64 encoded image string
+                                try:
+                                    img_bytes = base64.b64decode(img_data)
+                                    img = Image.open(BytesIO(img_bytes))
+                                    images.append(img)
+                                except Exception as e:
+                                    print(f"[WARNING] Failed to decode image from data.{field}: {e}")
+                            
+                            elif isinstance(img_data, dict):
+                                # Image object with url or data field
+                                if 'url' in img_data:
+                                    try:
+                                        img_response = requests.get(img_data['url'], timeout=30)
+                                        img = Image.open(BytesIO(img_response.content))
+                                        images.append(img)
+                                    except Exception as e:
+                                        print(f"[WARNING] Failed to download image from URL: {e}")
+                                elif 'data' in img_data:
+                                    try:
+                                        img_bytes = base64.b64decode(img_data['data'])
+                                        img = Image.open(BytesIO(img_bytes))
+                                        images.append(img)
+                                    except Exception as e:
+                                        print(f"[WARNING] Failed to decode image data: {e}")
+                                elif 'image' in img_data:
+                                    try:
+                                        img_str = img_data['image']
+                                        img_bytes = base64.b64decode(img_str)
+                                        img = Image.open(BytesIO(img_bytes))
+                                        images.append(img)
+                                    except Exception as e:
+                                        print(f"[WARNING] Failed to decode image from nested field: {e}")
+                            
+                            if images:
+                                break  # Found images, stop searching
+            
+            # If no images found in data field, try root level fields
+            if not images:
+                for field in image_fields:
+                    if field in result:
+                        img_data = result[field]
+                        
+                        # Handle list of images
+                        if isinstance(img_data, list):
+                            for item in img_data:
+                                if isinstance(item, str):
+                                    # Base64 encoded image string
+                                    try:
+                                        img_bytes = base64.b64decode(item)
+                                        img = Image.open(BytesIO(img_bytes))
+                                        images.append(img)
+                                    except Exception as e:
+                                        print(f"[WARNING] Failed to decode image from {field}: {e}")
+                                elif isinstance(item, dict) and 'url' in item:
+                                    # Image URL
+                                    try:
+                                        img_response = requests.get(item['url'], timeout=30)
+                                        img = Image.open(BytesIO(img_response.content))
+                                        images.append(img)
+                                    except Exception as e:
+                                        print(f"[WARNING] Failed to download image from URL: {e}")
+                        
+                        # Handle single image (string or dict)
+                        elif isinstance(img_data, str):
+                            # Base64 encoded image string
+                            try:
+                                img_bytes = base64.b64decode(img_data)
+                                img = Image.open(BytesIO(img_bytes))
+                                images.append(img)
+                            except Exception as e:
+                                print(f"[WARNING] Failed to decode image from {field}: {e}")
+                        
+                        elif isinstance(img_data, dict):
+                            # Image object with url or data field
+                            if 'url' in img_data:
+                                try:
+                                    img_response = requests.get(img_data['url'], timeout=30)
+                                    img = Image.open(BytesIO(img_response.content))
+                                    images.append(img)
+                                except Exception as e:
+                                    print(f"[WARNING] Failed to download image from URL: {e}")
+                            elif 'data' in img_data:
+                                try:
+                                    img_bytes = base64.b64decode(img_data['data'])
+                                    img = Image.open(BytesIO(img_bytes))
+                                    images.append(img)
+                                except Exception as e:
+                                    print(f"[WARNING] Failed to decode image data: {e}")
+                        
+                        if images:
+                            break  # Found images, stop searching
+            
+            if not images:
+                # Log the full response for debugging
+                print(f"[ERROR] No images found in API response. Response keys: {list(result.keys())}")
+                print(f"[ERROR] Response sample: {str(result)[:500]}")
+                if 'data' in result:
+                    print(f"[ERROR] Data keys: {list(result['data'].keys()) if isinstance(result['data'], dict) else 'Not a dict'}")
+                raise ValueError(f"No images returned from API. Response structure: {list(result.keys())}")
+            
+            return images
+    
+    KLINGAI_AVAILABLE = True  # Fallback implementation is available
 
 from networks import SegGenerator, GMM, ALIASGenerator
 from datasets import VITONDataset
@@ -105,11 +602,41 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.set_default_tensor_type("torch.FloatTensor")
 
 app = Flask(__name__, static_folder="static")
+app.secret_key = "viton_hd_fixed_secret_key_123"
+app.config["SESSION_PERMANENT"] = False
+
 os.makedirs("static", exist_ok=True)
 RESULT_DIR = os.path.join("static", "results")
 os.makedirs(RESULT_DIR, exist_ok=True)
 UPLOAD_DIR = os.path.join("static", "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+OUTPUT_DIR = os.path.join("static", "outputs")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Initialize KlingAI adapter (lazy loading)
+# The adapter will automatically read from environment variables when initialized
+_klingai_adapter = None
+
+def get_klingai_adapter():
+    """Get or create KlingAI adapter instance.
+    
+    The adapter automatically reads KLINGAI_API_KEY and KLINGAI_SECRET_KEY
+    from environment variables (loaded from .env file).
+    """
+    global _klingai_adapter
+    if _klingai_adapter is None and KLINGAI_AVAILABLE:
+        try:
+            # Initialize without parameters - adapter reads from environment variables
+            # This matches the original API usage: adapter = KlingAIVTONAdapter()
+            _klingai_adapter = KlingAIVTONAdapter()
+            print("[info] KlingAI adapter initialized successfully")
+        except ValueError as e:
+            print(f"[WARNING] {e}")
+            _klingai_adapter = None
+        except Exception as e:
+            print(f"[warn] Failed to initialize KlingAI adapter: {e}")
+            _klingai_adapter = None
+    return _klingai_adapter
 
 
 def to_url(path):
@@ -288,10 +815,11 @@ def compute_viton_crop_box(img_w, img_h, pose_keypoints, target_size=(768, 1024)
             left, right = 0, img_w
     else:
         # Use keypoints to determine bounding box
-        min_x = max(0, int(valid_keypoints[:, 0].min() - 50))
-        max_x = min(img_w, int(valid_keypoints[:, 0].max() + 50))
-        min_y = max(0, int(valid_keypoints[:, 1].min() - 100))  # More padding at top for head
-        max_y = min(img_h, int(valid_keypoints[:, 1].max() + 100))  # More padding at bottom for feet
+        # Increased padding to preserve edges and hands (which extend outward)
+        min_x = max(0, int(valid_keypoints[:, 0].min() - 80))  # Increased from 50 to preserve hands
+        max_x = min(img_w, int(valid_keypoints[:, 0].max() + 80))  # Increased from 50
+        min_y = max(0, int(valid_keypoints[:, 1].min() - 120))  # More padding at top for head
+        max_y = min(img_h, int(valid_keypoints[:, 1].max() + 120))  # More padding at bottom for feet
         
         # Calculate crop dimensions maintaining aspect ratio
         crop_w = max_x - min_x
@@ -329,8 +857,9 @@ def viton_center_crop(person_pil, pose_keypoints, target_size=(768, 1024)):
     left, top, right, bottom = compute_viton_crop_box(orig_w, orig_h, pose_keypoints, target_size)
     
     # Crop and resize
+    # Use LANCZOS for better quality and less distortion at edges
     cropped = person_pil.crop((left, top, right, bottom))
-    resized = cropped.resize(target_size, Image.BICUBIC)
+    resized = cropped.resize(target_size, Image.LANCZOS)
     
     # Scale keypoints to match resized image
     crop_w = right - left
@@ -1332,36 +1861,8 @@ def run_dataset_inference(pair_index):
         gmm_input = torch.cat((parse_cloth_gmm, pose_gmm, agnostic_gmm), dim=1)
 
         _, warped_grid = GMM_MODEL(gmm_input, c_gmm)
-        
-        # CRITICAL: Check warped_grid validity - if invalid, cloth will be distorted
-        grid_min = warped_grid.min().item()
-        grid_max = warped_grid.max().item()
-        grid_mean = warped_grid.mean().item()
-        grid_std = warped_grid.std().item()
-        
-        print(f"[DEBUG] Warped grid stats: min={grid_min:.3f}, max={grid_max:.3f}, mean={grid_mean:.3f}, std={grid_std:.3f}")
-        
-        # Grid should be in range [-1, 1] for grid_sample - normalize instead of clamp
-        if grid_min < -1.0 or grid_max > 1.0:
-            print(f"[CRITICAL] Warped grid out of valid range [-1, 1]! Normalizing to prevent cloth distortion...")
-            # Normalize to [-1, 1] range while preserving relative transformations
-            grid_range = grid_max - grid_min
-            if grid_range > 0:
-                # Scale to fit in [-1, 1] while maintaining center
-                warped_grid = (warped_grid - grid_mean) / (grid_range / 2.0) * 0.95  # 0.95 for safety margin
-                # Ensure it's within bounds
-                warped_grid = torch.clamp(warped_grid, -1.0, 1.0)
-            else:
-                # Fallback: just clamp if range is invalid
-                warped_grid = torch.clamp(warped_grid, -1.0, 1.0)
-            print(f"[INFO] Normalized warped grid to [{warped_grid.min().item():.3f}, {warped_grid.max().item():.3f}]")
-        
         warped_c = F.grid_sample(cloth, warped_grid, padding_mode="border", align_corners=False)
         warped_cm = F.grid_sample(cloth_mask, warped_grid, padding_mode="border", align_corners=False)
-        
-        # Debug: Check warped cloth
-        warped_c_sum = warped_c.sum().item()
-        print(f"[DEBUG] Warped cloth sum: {warped_c_sum:.0f} (should be > 0)")
 
         misalign_mask = torch.clamp(parse[:, 2:3] - warped_cm, min=0.0)
         parse_div = torch.cat((parse, misalign_mask), dim=1)
@@ -1778,6 +2279,563 @@ def run_custom_tryon_from_uploads(person_file, cloth_file):
 # -------------------------------------------------------------------------
 # HTML templates
 # -------------------------------------------------------------------------
+HTML_SIGNIN = """
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sign In - Virtual Dressing Room</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #0a0a0a;
+            background-image: 
+                radial-gradient(at 20% 30%, #1a1a1a 0%, transparent 50%),
+                radial-gradient(at 80% 70%, #151515 0%, transparent 50%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .signin-container {
+            background: linear-gradient(145deg, #1a1a1a 0%, #0f0f0f 100%);
+            padding: 50px;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.8), 
+                        0 0 0 1px rgba(255, 255, 255, 0.1),
+                        inset 0 1px 0 rgba(255, 255, 255, 0.05);
+            max-width: 450px;
+            width: 100%;
+            animation: slideUp 0.6s ease-out;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+        }
+        h1 {
+            font-size: 2.5rem;
+            background: linear-gradient(135deg, #ffffff 0%, #e0e0e0 50%, #ffffff 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            text-align: center;
+            margin-bottom: 10px;
+            text-shadow: 0 0 30px rgba(255, 255, 255, 0.2);
+        }
+        .subtitle {
+            text-align: center;
+            color: #a0a0a0;
+            margin-bottom: 30px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #d0d0d0;
+            font-weight: 500;
+        }
+        input[type="text"],
+        input[type="password"] {
+            width: 100%;
+            padding: 12px 15px;
+            background: #0a0a0a;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
+            font-size: 1rem;
+            color: #e0e0e0;
+            transition: all 0.3s;
+        }
+        input[type="text"]:focus,
+        input[type="password"]:focus {
+            outline: none;
+            border-color: #ffffff;
+            box-shadow: 0 0 15px rgba(255, 255, 255, 0.2);
+            background: #111111;
+        }
+        .btn {
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #ffffff 0%, #e0e0e0 100%);
+            color: #0a0a0a;
+            border: none;
+            border-radius: 10px;
+            font-size: 1.1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            box-shadow: 0 4px 15px rgba(255, 255, 255, 0.2);
+        }
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(255, 255, 255, 0.3);
+            background: linear-gradient(135deg, #e0e0e0 0%, #ffffff 100%);
+        }
+        .btn:active {
+            transform: translateY(0);
+        }
+        .error {
+            color: #ff6b6b;
+            text-align: center;
+            margin-bottom: 15px;
+            padding: 10px;
+            background: rgba(255, 107, 107, 0.1);
+            border: 1px solid rgba(255, 107, 107, 0.3);
+            border-radius: 5px;
+        }
+        @keyframes slideUp {
+            from { transform: translateY(30px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+    </style>
+</head>
+<body>
+    <div class="signin-container">
+        <h1>✨ Welcome</h1>
+        <p class="subtitle">Sign in to access Virtual Dressing Room</p>
+        {% if error %}
+        <div class="error">{{ error }}</div>
+        {% endif %}
+        <form method="POST" action="/signin">
+            <div class="form-group">
+                <label for="username">Username</label>
+                <input type="text" id="username" name="username" required autofocus>
+            </div>
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" required>
+            </div>
+            <button type="submit" class="btn">Sign In</button>
+        </form>
+        <p style="text-align: center; margin-top: 20px; color: #666; font-size: 0.9rem;">
+            Demo: Use any username/password to sign in
+        </p>
+    </div>
+</body>
+</html>
+"""
+
+HTML_DASHBOARD = """
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard - Virtual Dressing Room</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #0a0a0a;
+            background-image: 
+                radial-gradient(at 20% 30%, #1a1a1a 0%, transparent 50%),
+                radial-gradient(at 80% 70%, #151515 0%, transparent 50%);
+            min-height: 100vh;
+            padding: 30px 20px;
+        }
+        .header {
+            text-align: center;
+            color: #e0e0e0;
+            margin-bottom: 40px;
+        }
+        .header h1 {
+            font-size: 3rem;
+            margin-bottom: 10px;
+            background: linear-gradient(135deg, #ffffff 0%, #e0e0e0 50%, #ffffff 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            text-shadow: 0 0 30px rgba(255, 255, 255, 0.2);
+        }
+        .header p {
+            font-size: 1.2rem;
+            color: #a0a0a0;
+        }
+        .logout-btn {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            padding: 10px 20px;
+            background: rgba(255, 255, 255, 0.1);
+            color: #ffffff;
+            text-decoration: none;
+            border-radius: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            transition: all 0.3s;
+        }
+        .logout-btn:hover {
+            background: rgba(255, 255, 255, 0.2);
+            border-color: rgba(255, 255, 255, 0.5);
+            box-shadow: 0 0 15px rgba(255, 255, 255, 0.3);
+        }
+        .options-container {
+            max-width: 1000px;
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 30px;
+        }
+        .option-card {
+            background: linear-gradient(145deg, #1a1a1a 0%, #0f0f0f 100%);
+            padding: 40px;
+            border-radius: 20px;
+            text-align: center;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.8),
+                        0 0 0 1px rgba(255, 255, 255, 0.1),
+                        inset 0 1px 0 rgba(255, 255, 255, 0.05);
+            transition: all 0.3s;
+            cursor: pointer;
+            text-decoration: none;
+            color: inherit;
+            display: block;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+        }
+        .option-card:hover {
+            transform: translateY(-10px);
+            box-shadow: 0 30px 80px rgba(0,0,0,0.9),
+                        0 0 0 1px rgba(255, 255, 255, 0.3),
+                        0 0 30px rgba(255, 255, 255, 0.2);
+            border-color: rgba(255, 255, 255, 0.4);
+        }
+        .option-card h2 {
+            font-size: 2rem;
+            background: linear-gradient(135deg, #ffffff 0%, #e0e0e0 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 15px;
+        }
+        .option-card p {
+            color: #a0a0a0;
+            font-size: 1.1rem;
+            margin-bottom: 20px;
+        }
+        .icon {
+            font-size: 4rem;
+            margin-bottom: 20px;
+            filter: drop-shadow(0 0 10px rgba(255, 255, 255, 0.2));
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .option-card {
+            animation: fadeIn 0.6s ease-out;
+        }
+        .option-card:nth-child(2) {
+            animation-delay: 0.2s;
+        }
+        .option-card:nth-child(3) {
+            animation-delay: 0.4s;
+        }
+    </style>
+</head>
+<body>
+    <a href="/logout" class="logout-btn">Logout</a>
+    <div class="header">
+        <h1>✨ Virtual Dressing Room</h1>
+        <p>Welcome, {{ username }}! Choose your experience:</p>
+    </div>
+    <div class="options-container">
+        <a href="/realtime" class="option-card">
+            <div class="icon">📹</div>
+            <h2>Real-Time Try-On</h2>
+            <p>Use your camera for live virtual try-on with MediaPipe pose detection</p>
+        </a>
+        <a href="/predict" class="option-card">
+            <div class="icon">🖼️</div>
+            <h2>Dataset Pairs</h2>
+            <p>Try on clothes from our curated dataset pairs</p>
+        </a>
+        <a href="/custom" class="option-card">
+            <div class="icon" style="font-size: 3rem; font-weight: bold; line-height: 1;">U</div>
+            <h2>Custom Uploads</h2>
+            <p>Upload your own images for AI-powered virtual try-on</p>
+        </a>
+    </div>
+</body>
+</html>
+"""
+
+HTML_REALTIME = """
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-Time Try-On - Virtual Dressing Room</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #0a0a0a;
+            background-image: 
+                radial-gradient(at 20% 30%, #1a1a1a 0%, transparent 50%),
+                radial-gradient(at 80% 70%, #151515 0%, transparent 50%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: linear-gradient(145deg, #1a1a1a 0%, #0f0f0f 100%);
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.8),
+                        0 0 0 1px rgba(255, 255, 255, 0.1),
+                        inset 0 1px 0 rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .header h1 {
+            font-size: 2.5rem;
+            background: linear-gradient(135deg, #ffffff 0%, #e0e0e0 50%, #ffffff 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 10px;
+            text-shadow: 0 0 30px rgba(255, 255, 255, 0.2);
+        }
+        .header p {
+            color: #a0a0a0;
+        }
+        .video-container {
+            position: relative;
+            width: 100%;
+            max-width: 1280px;
+            margin: 0 auto;
+            background: #000;
+            border-radius: 20px;
+            overflow: hidden;
+            margin-bottom: 20px;
+            border: 2px solid rgba(255, 255, 255, 0.2);
+            box-shadow: 0 0 30px rgba(0, 0, 0, 0.8);
+        }
+        #videoStream {
+            width: 100%;
+            display: block;
+        }
+        .controls {
+            text-align: center;
+            margin-top: 20px;
+        }
+        .btn {
+            display: inline-block;
+            padding: 12px 30px;
+            margin: 0 10px;
+            background: linear-gradient(135deg, #ffffff 0%, #e0e0e0 100%);
+            color: #0a0a0a;
+            border: none;
+            border-radius: 25px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            box-shadow: 0 4px 15px rgba(255, 255, 255, 0.2);
+        }
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(255, 255, 255, 0.3);
+            background: linear-gradient(135deg, #e0e0e0 0%, #ffffff 100%);
+        }
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+        .back-btn {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            padding: 10px 20px;
+            background: rgba(255, 255, 255, 0.1);
+            color: #ffffff;
+            text-decoration: none;
+            border-radius: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            transition: all 0.3s;
+            z-index: 10;
+        }
+        .back-btn:hover {
+            background: rgba(255, 255, 255, 0.2);
+            border-color: rgba(255, 255, 255, 0.5);
+            box-shadow: 0 0 15px rgba(255, 255, 255, 0.3);
+        }
+        .info {
+            text-align: center;
+            color: #a0a0a0;
+            margin-top: 15px;
+        }
+        .info p {
+            margin: 5px 0;
+        }
+        .shirt-gallery {
+            display: flex;
+            justify-content: center;
+            flex-wrap: wrap;
+            gap: 15px;
+            margin-top: 20px;
+            padding: 20px;
+            background: #0a0a0a;
+            border-radius: 15px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .shirt-thumb {
+            width: 100px;
+            height: 100px;
+            object-fit: cover;
+            border-radius: 10px;
+            cursor: pointer;
+            border: 3px solid transparent;
+            transition: all 0.3s;
+        }
+        .shirt-thumb:hover {
+            transform: scale(1.1);
+            border-color: rgba(255, 255, 255, 0.5);
+            box-shadow: 0 0 20px rgba(255, 255, 255, 0.3);
+        }
+        .shirt-thumb.selected {
+            border-color: #ffffff;
+            box-shadow: 0 0 20px rgba(255, 255, 255, 0.4);
+        }
+    </style>
+</head>
+<body>
+    <a href="/dashboard" class="back-btn">← Back to Dashboard</a>
+    <div class="container">
+        <div class="header">
+            <h1>📹 Real-Time Virtual Try-On</h1>
+            <p>Position yourself in front of the camera to try on shirts</p>
+        </div>
+        <div class="video-container">
+            <img id="videoStream" src="/video_feed" alt="Video Stream">
+        </div>
+        <div class="controls">
+            <button id="startBtn" class="btn" onclick="startCamera()">Start Camera</button>
+            <button id="stopBtn" class="btn" onclick="stopCamera()" disabled>Stop Camera</button>
+            <button class="btn" onclick="prevShirt()">← Previous</button>
+            <button class="btn" onclick="nextShirt()">Next →</button>
+        </div>
+        <div class="info">
+            <p>Use arrow keys or buttons to switch between shirts</p>
+            <p id="shirtInfo">No shirt selected</p>
+        </div>
+        <div class="shirt-gallery" id="shirtGallery">
+            <!-- Shirt thumbnails will be loaded here -->
+        </div>
+    </div>
+    <script>
+        let currentShirtIndex = 0;
+        let shirtCount = 0;
+        
+        function startCamera() {
+            document.getElementById('startBtn').disabled = true;
+            document.getElementById('stopBtn').disabled = false;
+            // Camera starts automatically via video feed
+        }
+        
+        function stopCamera() {
+            document.getElementById('startBtn').disabled = false;
+            document.getElementById('stopBtn').disabled = true;
+            // Stop video stream
+            document.getElementById('videoStream').src = '';
+        }
+        
+        function nextShirt() {
+            fetch('/realtime/next_shirt', {method: 'POST'})
+                .then(() => updateShirtInfo());
+        }
+        
+        function prevShirt() {
+            fetch('/realtime/prev_shirt', {method: 'POST'})
+                .then(() => updateShirtInfo());
+        }
+        
+        function selectShirt(index) {
+            fetch('/realtime/set_shirt/' + index, {method: 'POST'})
+                .then(() => {
+                    currentShirtIndex = index;
+                    updateShirtGallery();
+                    updateShirtInfo();
+                });
+        }
+        
+        function updateShirtInfo() {
+            fetch('/realtime/info')
+                .then(r => r.json())
+                .then(data => {
+                    document.getElementById('shirtInfo').textContent = 
+                        `Current: ${data.shirt_name} (${data.current_shirt + 1}/${data.shirt_count})`;
+                    currentShirtIndex = data.current_shirt;
+                    updateShirtGallery();
+                });
+        }
+        
+        function updateShirtGallery() {
+            const gallery = document.getElementById('shirtGallery');
+            gallery.innerHTML = '';
+            if (shirtCount === 0) {
+                gallery.innerHTML = '<p style="color: #999; width: 100%; text-align: center;">No shirts available. Add shirts to static/shirts/</p>';
+                return;
+            }
+            fetch('/realtime/shirt_list')
+                .then(r => r.json())
+                .then(data => {
+                    data.shirts.forEach((shirt, i) => {
+                        const thumb = document.createElement('img');
+                        thumb.src = `/static/shirts/${shirt}`;
+                        thumb.className = 'shirt-thumb' + (i === currentShirtIndex ? ' selected' : '');
+                        thumb.onclick = () => selectShirt(i);
+                        thumb.onerror = function() {
+                            this.style.display = 'none';
+                        };
+                        gallery.appendChild(thumb);
+                    });
+                })
+                .catch(() => {
+                    gallery.innerHTML = '<p style="color: #999; width: 100%; text-align: center;">Unable to load shirt gallery</p>';
+                });
+        }
+        
+        // Keyboard controls
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowLeft') prevShirt();
+            if (e.key === 'ArrowRight') nextShirt();
+        });
+        
+        // Load shirt info on page load
+        fetch('/realtime/info')
+            .then(r => r.json())
+            .then(data => {
+                shirtCount = data.shirt_count;
+                currentShirtIndex = data.current_shirt;
+                updateShirtGallery();
+                updateShirtInfo();
+            });
+        
+        // Update shirt info periodically
+        setInterval(updateShirtInfo, 2000);
+    </script>
+</body>
+</html>
+"""
+
 HTML_HOME = """
 <!doctype html>
 <html lang="en">
@@ -1793,7 +2851,10 @@ HTML_HOME = """
         }
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: #0a0a0a;
+            background-image: 
+                radial-gradient(at 20% 30%, #1a1a1a 0%, transparent 50%),
+                radial-gradient(at 80% 70%, #151515 0%, transparent 50%);
             min-height: 100vh;
             display: flex;
             align-items: center;
@@ -1802,38 +2863,43 @@ HTML_HOME = """
         }
         .container {
             text-align: center;
-            color: white;
+            color: #e0e0e0;
             animation: fadeIn 1s ease-in;
         }
         h1 {
             font-size: 4rem;
             margin-bottom: 1rem;
-            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+            background: linear-gradient(135deg, #ffffff 0%, #e0e0e0 50%, #ffffff 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            text-shadow: 0 0 30px rgba(255, 255, 255, 0.2);
             animation: slideDown 0.8s ease-out;
         }
         p {
             font-size: 1.3rem;
             margin-bottom: 2rem;
-            opacity: 0.95;
+            color: #a0a0a0;
             animation: slideUp 0.8s ease-out 0.2s both;
         }
         .btn {
             display: inline-block;
             padding: 18px 45px;
             font-size: 1.2rem;
-            background: rgba(255,255,255,0.2);
-            color: white;
+            background: linear-gradient(135deg, #ffffff 0%, #e0e0e0 100%);
+            color: #0a0a0a;
             text-decoration: none;
             border-radius: 50px;
-            border: 2px solid rgba(255,255,255,0.3);
+            border: none;
             transition: all 0.3s ease;
-            backdrop-filter: blur(10px);
+            font-weight: 600;
+            box-shadow: 0 4px 15px rgba(255, 255, 255, 0.2);
             animation: slideUp 0.8s ease-out 0.4s both;
         }
         .btn:hover {
-            background: rgba(255,255,255,0.3);
             transform: translateY(-3px);
-            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+            box-shadow: 0 10px 30px rgba(255, 255, 255, 0.3);
+            background: linear-gradient(135deg, #e0e0e0 0%, #ffffff 100%);
         }
         @keyframes fadeIn {
             from { opacity: 0; }
@@ -1874,7 +2940,10 @@ HTML_PREDICT = """
         }
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: #0a0a0a;
+            background-image: 
+                radial-gradient(at 20% 30%, #1a1a1a 0%, transparent 50%),
+                radial-gradient(at 80% 70%, #151515 0%, transparent 50%);
             min-height: 100vh;
             display: flex;
             align-items: center;
@@ -1885,11 +2954,13 @@ HTML_PREDICT = """
         .main-container {
             width: 100%;
             max-width: 1200px;
-            background: rgba(255, 255, 255, 0.95);
-            border-radius: 30px;
+            background: linear-gradient(145deg, #1a1a1a 0%, #0f0f0f 100%);
+            border-radius: 20px;
             padding: 50px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            backdrop-filter: blur(10px);
+            box-shadow: 0 20px 60px rgba(0,0,0,0.8),
+                        0 0 0 1px rgba(255, 255, 255, 0.1),
+                        inset 0 1px 0 rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.15);
             animation: slideUp 0.6s ease-out;
         }
         .header {
@@ -1898,31 +2969,34 @@ HTML_PREDICT = """
         }
         .header h1 {
             font-size: 3rem;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #ffffff 0%, #e0e0e0 50%, #ffffff 100%);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             background-clip: text;
             margin-bottom: 10px;
+            text-shadow: 0 0 30px rgba(255, 255, 255, 0.2);
         }
         .header p {
-            color: #666;
+            color: #a0a0a0;
             font-size: 1.1rem;
         }
         .stats {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
+            background: linear-gradient(135deg, rgba(255, 255, 255, 0.1) 0%, rgba(224, 224, 224, 0.05) 100%);
+            color: #ffffff;
             padding: 20px;
             border-radius: 15px;
             text-align: center;
             margin-bottom: 30px;
             font-size: 1.2rem;
             font-weight: 600;
+            border: 1px solid rgba(255, 255, 255, 0.3);
         }
         .form-container {
-            background: #f8f9fa;
+            background: #0a0a0a;
             padding: 40px;
             border-radius: 20px;
-            box-shadow: inset 0 2px 10px rgba(0,0,0,0.05);
+            box-shadow: inset 0 2px 10px rgba(0,0,0,0.3);
+            border: 1px solid rgba(255, 255, 255, 0.1);
         }
         .form-group {
             margin-bottom: 25px;
@@ -1930,7 +3004,7 @@ HTML_PREDICT = """
         label {
             display: block;
             font-weight: 600;
-            color: #333;
+            color: #d0d0d0;
             margin-bottom: 12px;
             font-size: 1.1rem;
         }
@@ -1938,21 +3012,23 @@ HTML_PREDICT = """
             width: 100%;
             padding: 15px 20px;
             font-size: 1rem;
-            border: 2px solid #e0e0e0;
+            border: 1px solid rgba(255, 255, 255, 0.2);
             border-radius: 12px;
-            background: white;
+            background: #111111;
+            color: #e0e0e0;
             transition: all 0.3s ease;
             font-family: inherit;
         }
         select:focus, input[type="number"]:focus {
             outline: none;
-            border-color: #667eea;
-            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+            border-color: #ffffff;
+            box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.1);
+            background: #151515;
         }
         select {
             cursor: pointer;
             appearance: none;
-            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23667eea' d='M6 9L1 4h10z'/%3E%3C/svg%3E");
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23ffd700' d='M6 9L1 4h10z'/%3E%3C/svg%3E");
             background-repeat: no-repeat;
             background-position: right 20px center;
             padding-right: 50px;
@@ -1962,41 +3038,43 @@ HTML_PREDICT = """
             padding: 18px;
             font-size: 1.2rem;
             font-weight: 600;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
+            background: linear-gradient(135deg, #ffffff 0%, #e0e0e0 100%);
+            color: #0a0a0a;
             border: none;
             border-radius: 12px;
             cursor: pointer;
             transition: all 0.3s ease;
             margin-top: 10px;
-            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+            box-shadow: 0 4px 15px rgba(255, 255, 255, 0.2);
         }
         .btn-submit:hover {
             transform: translateY(-2px);
-            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.5);
+            box-shadow: 0 6px 20px rgba(255, 255, 255, 0.3);
+            background: linear-gradient(135deg, #e0e0e0 0%, #ffffff 100%);
         }
         .btn-submit:active {
             transform: translateY(0);
         }
         .error-message {
-            background: #fee;
-            color: #c33;
+            background: rgba(255, 107, 107, 0.1);
+            color: #ff6b6b;
             padding: 20px;
             border-radius: 12px;
             text-align: center;
-            border: 2px solid #fcc;
+            border: 1px solid rgba(255, 107, 107, 0.3);
         }
         .loading {
             display: none;
             text-align: center;
             padding: 20px;
+            color: #a0a0a0;
         }
         .loading.active {
             display: block;
         }
         .spinner {
-            border: 4px solid rgba(102, 126, 234, 0.2);
-            border-top: 4px solid #667eea;
+            border: 4px solid rgba(255, 255, 255, 0.2);
+            border-top: 4px solid #ffffff;
             border-radius: 50%;
             width: 40px;
             height: 40px;
@@ -2019,7 +3097,7 @@ HTML_PREDICT = """
         }
         .divider {
             height: 1px;
-            background: linear-gradient(90deg, transparent, #ddd, transparent);
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
             margin: 25px 0;
         }
     </style>
@@ -2127,7 +3205,10 @@ HTML_RESULT = """
         }
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: #0a0a0a;
+            background-image: 
+                radial-gradient(at 20% 30%, #1a1a1a 0%, transparent 50%),
+                radial-gradient(at 80% 70%, #151515 0%, transparent 50%);
             min-height: 100vh;
             padding: 30px 20px;
             overflow-x: hidden;
@@ -2135,28 +3216,32 @@ HTML_RESULT = """
         .container {
             max-width: 1400px;
             margin: 0 auto;
-            background: rgba(255, 255, 255, 0.98);
-            border-radius: 30px;
+            background: linear-gradient(145deg, #1a1a1a 0%, #0f0f0f 100%);
+            border-radius: 20px;
             padding: 50px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            box-shadow: 0 20px 60px rgba(0,0,0,0.8),
+                        0 0 0 1px rgba(255, 255, 255, 0.1),
+                        inset 0 1px 0 rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.15);
             animation: fadeIn 0.6s ease-out;
         }
         .header {
             text-align: center;
             margin-bottom: 40px;
             padding-bottom: 30px;
-            border-bottom: 2px solid #f0f0f0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.2);
         }
         .header h1 {
             font-size: 2.5rem;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #ffffff 0%, #e0e0e0 50%, #ffffff 100%);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             background-clip: text;
             margin-bottom: 15px;
+            text-shadow: 0 0 30px rgba(255, 255, 255, 0.2);
         }
         .header .info {
-            color: #666;
+            color: #a0a0a0;
             font-size: 1.1rem;
         }
         .result-grid {
@@ -2166,29 +3251,32 @@ HTML_RESULT = """
             margin-bottom: 40px;
         }
         .result-card {
-            background: #f8f9fa;
+            background: linear-gradient(145deg, #1a1a1a 0%, #0f0f0f 100%);
             border-radius: 20px;
             padding: 25px;
             text-align: center;
             transition: all 0.3s ease;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            border: 1px solid rgba(255, 255, 255, 0.1);
         }
         .result-card:hover {
             transform: translateY(-5px);
-            box-shadow: 0 8px 25px rgba(0,0,0,0.15);
+            box-shadow: 0 8px 25px rgba(0,0,0,0.7),
+                        0 0 0 1px rgba(255, 255, 255, 0.2);
+            border-color: rgba(255, 255, 255, 0.3);
         }
         .result-card.featured {
             grid-column: 1 / -1;
-            background: linear-gradient(135deg, #667eea15 0%, #764ba215 100%);
-            border: 2px solid #667eea;
+            background: linear-gradient(135deg, rgba(255, 255, 255, 0.1) 0%, rgba(224, 224, 224, 0.05) 100%);
+            border: 2px solid rgba(255, 255, 255, 0.4);
         }
         .result-card h3 {
-            color: #333;
+            color: #d0d0d0;
             margin-bottom: 20px;
             font-size: 1.3rem;
         }
         .result-card.featured h3 {
-            color: #667eea;
+            color: #ffffff;
             font-size: 1.5rem;
         }
         .result-card img {
@@ -2198,6 +3286,11 @@ HTML_RESULT = """
             border-radius: 15px;
             box-shadow: 0 4px 15px rgba(0,0,0,0.2);
             transition: transform 0.3s ease;
+        }
+        .result-card.featured img {
+            max-width: 800px;
+            margin: 0 auto;
+            display: block;
         }
         .result-card:hover img {
             transform: scale(1.02);
@@ -2211,16 +3304,17 @@ HTML_RESULT = """
             padding: 18px 45px;
             font-size: 1.1rem;
             font-weight: 600;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
+            background: linear-gradient(135deg, #ffffff 0%, #e0e0e0 100%);
+            color: #0a0a0a;
             text-decoration: none;
             border-radius: 50px;
             transition: all 0.3s ease;
-            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+            box-shadow: 0 4px 15px rgba(255, 255, 255, 0.2);
         }
         .btn:hover {
             transform: translateY(-3px);
-            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.5);
+            box-shadow: 0 6px 20px rgba(255, 255, 255, 0.3);
+            background: linear-gradient(135deg, #e0e0e0 0%, #ffffff 100%);
         }
         @keyframes fadeIn {
             from {
@@ -2299,6 +3393,491 @@ HTML_OVERLAY_RESULT = """
 <p><a href="/predict">Try another</a></p>
 """
 
+HTML_CUSTOM = """
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Custom Upload - Virtual Dressing Room</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #0a0a0a;
+            background-image: 
+                radial-gradient(at 20% 30%, #1a1a1a 0%, transparent 50%),
+                radial-gradient(at 80% 70%, #151515 0%, transparent 50%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            overflow-x: hidden;
+        }
+        .main-container {
+            width: 100%;
+            max-width: 1200px;
+            background: linear-gradient(145deg, #1a1a1a 0%, #0f0f0f 100%);
+            border-radius: 20px;
+            padding: 50px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.8),
+                        0 0 0 1px rgba(255, 255, 255, 0.1),
+                        inset 0 1px 0 rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            animation: slideUp 0.6s ease-out;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+        .header h1 {
+            font-size: 3rem;
+            background: linear-gradient(135deg, #ffffff 0%, #e0e0e0 50%, #ffffff 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 10px;
+            text-shadow: 0 0 30px rgba(255, 255, 255, 0.2);
+        }
+        .header p {
+            color: #a0a0a0;
+            font-size: 1.1rem;
+        }
+        .back-btn {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            padding: 10px 20px;
+            background: rgba(255, 255, 255, 0.1);
+            color: #ffffff;
+            text-decoration: none;
+            border-radius: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            transition: all 0.3s;
+        }
+        .back-btn:hover {
+            background: rgba(255, 255, 255, 0.2);
+            border-color: rgba(255, 255, 255, 0.5);
+        }
+        .form-container {
+            background: #0a0a0a;
+            padding: 40px;
+            border-radius: 20px;
+            box-shadow: inset 0 2px 10px rgba(0,0,0,0.3);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .upload-section {
+            margin-bottom: 30px;
+        }
+        .upload-section label {
+            display: block;
+            font-weight: 600;
+            color: #d0d0d0;
+            margin-bottom: 12px;
+            font-size: 1.1rem;
+        }
+        .file-input-wrapper {
+            position: relative;
+            display: inline-block;
+            width: 100%;
+        }
+        .file-input-wrapper input[type="file"] {
+            width: 100%;
+            padding: 15px 20px;
+            font-size: 1rem;
+            border: 2px dashed rgba(255, 255, 255, 0.3);
+            border-radius: 12px;
+            background: #111111;
+            color: #e0e0e0;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        .file-input-wrapper input[type="file"]:hover {
+            border-color: rgba(255, 255, 255, 0.5);
+            background: #151515;
+        }
+        .file-input-wrapper input[type="file"]:focus {
+            outline: none;
+            border-color: #ffffff;
+            box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.1);
+        }
+        .preview-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-top: 20px;
+        }
+        .preview-box {
+            background: #111111;
+            border-radius: 12px;
+            padding: 15px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .preview-box img {
+            width: 100%;
+            height: auto;
+            border-radius: 8px;
+            display: none;
+        }
+        .preview-box img.show {
+            display: block;
+        }
+        .btn-submit {
+            width: 100%;
+            padding: 18px;
+            font-size: 1.2rem;
+            font-weight: 600;
+            background: linear-gradient(135deg, #ffffff 0%, #e0e0e0 100%);
+            color: #0a0a0a;
+            border: none;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin-top: 20px;
+            box-shadow: 0 4px 15px rgba(255, 255, 255, 0.2);
+        }
+        .btn-submit:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(255, 255, 255, 0.3);
+            background: linear-gradient(135deg, #e0e0e0 0%, #ffffff 100%);
+        }
+        .btn-submit:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 20px;
+            color: #a0a0a0;
+        }
+        .loading.active {
+            display: block;
+        }
+        .spinner {
+            border: 4px solid rgba(255, 255, 255, 0.2);
+            border-top: 4px solid #ffffff;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 15px;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        @keyframes slideUp {
+            from {
+                transform: translateY(30px);
+                opacity: 0;
+            }
+            to {
+                transform: translateY(0);
+                opacity: 1;
+            }
+        }
+        .error-message {
+            background: rgba(255, 107, 107, 0.1);
+            color: #ff6b6b;
+            padding: 20px;
+            border-radius: 12px;
+            text-align: center;
+            border: 1px solid rgba(255, 107, 107, 0.3);
+            margin-bottom: 20px;
+            display: none;
+        }
+        .error-message.show {
+            display: block;
+        }
+        .info-message {
+            background: rgba(100, 181, 246, 0.1);
+            color: #64b5f6;
+            padding: 15px;
+            border-radius: 12px;
+            text-align: center;
+            border: 1px solid rgba(100, 181, 246, 0.3);
+            margin-bottom: 20px;
+            font-size: 0.95rem;
+        }
+    </style>
+</head>
+<body>
+    <a href="/dashboard" class="back-btn">← Back to Dashboard</a>
+    <div class="main-container">
+        <div class="header">
+            <h1>Custom Upload</h1>
+            <p>Upload your own person and clothing images for AI-powered virtual try-on</p>
+        </div>
+        
+        <div class="info-message">
+            Upload a person image and a clothing item image. The AI will generate a realistic try-on result.
+        </div>
+        
+        <div class="error-message" id="errorMessage"></div>
+        
+        <form method="POST" action="/custom" enctype="multipart/form-data" id="customForm" class="form-container">
+            <div class="upload-section">
+                <label for="person_image">Person Image</label>
+                <div class="file-input-wrapper">
+                    <input type="file" name="person_image" id="person_image" accept="image/*" required>
+                </div>
+                <div class="preview-container">
+                    <div class="preview-box">
+                        <img id="personPreview" alt="Person preview">
+                    </div>
+                </div>
+            </div>
+            
+            <div class="upload-section">
+                <label for="cloth_image">Clothing Image</label>
+                <div class="file-input-wrapper">
+                    <input type="file" name="cloth_image" id="cloth_image" accept="image/*" required>
+                </div>
+                <div class="preview-container">
+                    <div class="preview-box">
+                        <img id="clothPreview" alt="Cloth preview">
+                    </div>
+                </div>
+            </div>
+            
+            <div class="upload-section">
+                <label for="model_version">Model Version</label>
+                <select name="model_version" id="model_version" class="file-input-wrapper" style="padding: 15px 20px; font-size: 1rem; border: 1px solid rgba(255, 255, 255, 0.2); border-radius: 12px; background: #111111; color: #e0e0e0; cursor: pointer; width: 100%;">
+                    <option value="kolors-virtual-try-on-v1-5" selected>kolors-virtual-try-on-v1-5 (Enhanced - Recommended)</option>
+                    <option value="kolors-virtual-try-on-v1">kolors-virtual-try-on-v1 (Original)</option>
+                </select>
+                <p style="color: #a0a0a0; font-size: 0.9rem; margin-top: 8px;">Select the AI model version. v1-5 is the enhanced version with better results.</p>
+            </div>
+            
+            <button type="submit" class="btn-submit" id="submitBtn">Generate Try-On</button>
+            
+            <div class="loading" id="loading">
+                <div class="spinner"></div>
+                <p>Generating your virtual try-on with AI... This may take a moment</p>
+            </div>
+        </form>
+    </div>
+    
+    <script>
+        const personInput = document.getElementById('person_image');
+        const clothInput = document.getElementById('cloth_image');
+        const personPreview = document.getElementById('personPreview');
+        const clothPreview = document.getElementById('clothPreview');
+        const form = document.getElementById('customForm');
+        const loading = document.getElementById('loading');
+        const submitBtn = document.getElementById('submitBtn');
+        const errorMessage = document.getElementById('errorMessage');
+        
+        function showError(message) {
+            errorMessage.textContent = message;
+            errorMessage.classList.add('show');
+            setTimeout(() => {
+                errorMessage.classList.remove('show');
+            }, 5000);
+        }
+        
+        personInput.addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    personPreview.src = e.target.result;
+                    personPreview.classList.add('show');
+                };
+                reader.readAsDataURL(file);
+            }
+        });
+        
+        clothInput.addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    clothPreview.src = e.target.result;
+                    clothPreview.classList.add('show');
+                };
+                reader.readAsDataURL(file);
+            }
+        });
+        
+        form.addEventListener('submit', function(e) {
+            if (!personInput.files[0] || !clothInput.files[0]) {
+                e.preventDefault();
+                showError('Please upload both person and clothing images.');
+                return false;
+            }
+            
+            loading.classList.add('active');
+            submitBtn.disabled = true;
+        });
+    </script>
+</body>
+</html>
+"""
+
+HTML_CUSTOM_RESULT = """
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Custom Try-On Result - Virtual Dressing Room</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #0a0a0a;
+            background-image: 
+                radial-gradient(at 20% 30%, #1a1a1a 0%, transparent 50%),
+                radial-gradient(at 80% 70%, #151515 0%, transparent 50%);
+            min-height: 100vh;
+            padding: 30px 20px;
+            overflow-x: hidden;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: linear-gradient(145deg, #1a1a1a 0%, #0f0f0f 100%);
+            border-radius: 20px;
+            padding: 50px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.8),
+                        0 0 0 1px rgba(255, 255, 255, 0.1),
+                        inset 0 1px 0 rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            animation: fadeIn 0.6s ease-out;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 40px;
+            padding-bottom: 30px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        .header h1 {
+            font-size: 2.5rem;
+            background: linear-gradient(135deg, #ffffff 0%, #e0e0e0 50%, #ffffff 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 15px;
+            text-shadow: 0 0 30px rgba(255, 255, 255, 0.2);
+        }
+        .result-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 30px;
+            margin-bottom: 40px;
+        }
+        .result-card {
+            background: linear-gradient(145deg, #1a1a1a 0%, #0f0f0f 100%);
+            border-radius: 20px;
+            padding: 25px;
+            text-align: center;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .result-card.featured {
+            grid-column: 1 / -1;
+            background: linear-gradient(135deg, rgba(255, 255, 255, 0.1) 0%, rgba(224, 224, 224, 0.05) 100%);
+            border: 2px solid rgba(255, 255, 255, 0.4);
+        }
+        .result-card h3 {
+            color: #d0d0d0;
+            margin-bottom: 20px;
+            font-size: 1.3rem;
+        }
+        .result-card.featured h3 {
+            color: #ffffff;
+            font-size: 1.5rem;
+        }
+        .result-card img {
+            width: 100%;
+            max-width: 100%;
+            height: auto;
+            border-radius: 15px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+        }
+        .result-card.featured img {
+            max-width: 800px;
+            margin: 0 auto;
+            display: block;
+        }
+        .btn-container {
+            text-align: center;
+            margin-top: 40px;
+        }
+        .btn {
+            display: inline-block;
+            padding: 18px 45px;
+            font-size: 1.1rem;
+            font-weight: 600;
+            background: linear-gradient(135deg, #ffffff 0%, #e0e0e0 100%);
+            color: #0a0a0a;
+            text-decoration: none;
+            border-radius: 50px;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(255, 255, 255, 0.2);
+            margin: 0 10px;
+        }
+        .btn:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 6px 20px rgba(255, 255, 255, 0.3);
+            background: linear-gradient(135deg, #e0e0e0 0%, #ffffff 100%);
+        }
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Custom Try-On Result</h1>
+        </div>
+        
+        <div class="result-grid">
+            <div class="result-card featured">
+                <h3>Generated Try-On</h3>
+                <img src="{{ result_url }}" alt="Generated Try-On Result">
+            </div>
+            
+            <div class="result-card">
+                <h3>Original Person</h3>
+                <img src="{{ person_url }}" alt="Original Person">
+            </div>
+            
+            <div class="result-card">
+                <h3>Original Clothing</h3>
+                <img src="{{ cloth_url }}" alt="Original Clothing">
+            </div>
+        </div>
+        
+        <div class="btn-container">
+            <a href="/custom" class="btn">Try Another</a>
+            <a href="/dashboard" class="btn">Back to Dashboard</a>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
 
 def base_context():
     return {
@@ -2311,13 +3890,193 @@ def base_context():
 # -------------------------------------------------------------------------
 # Flask routes
 # -------------------------------------------------------------------------
+
+# Initialize realtime try-on system (lazy loading)
+_realtime_system = None
+
+def get_realtime_system():
+    """Get or create realtime try-on system instance."""
+    global _realtime_system
+    if _realtime_system is None:
+        try:
+            from realtime_tryon import RealtimeTryOn
+            shirt_folder = os.path.join("static", "shirts")
+            _realtime_system = RealtimeTryOn(shirt_folder=shirt_folder)
+            print(f"[info] Realtime try-on system initialized with {len(_realtime_system.shirts)} shirts")
+        except Exception as e:
+            print(f"[warn] Failed to initialize realtime system: {e}")
+            _realtime_system = None
+    return _realtime_system
+
 @app.route("/", methods=["GET"])
 def home():
-    return render_template_string(HTML_HOME)
+    """Redirect to sign-in if not authenticated, else dashboard."""
+    if 'username' in session:
+        return redirect(url_for('dashboard'))
+    return redirect(url_for('signin'))
+
+@app.route("/signin", methods=["GET", "POST"])
+def signin():
+    """Sign-in page and authentication."""
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "").strip()
+        
+        # Simple demo authentication - accept any non-empty credentials
+        if username and password:
+            session['username'] = username
+            return redirect(url_for('dashboard'))
+        else:
+            return render_template_string(HTML_SIGNIN, error="Please enter both username and password")
+    
+    # If already signed in, redirect to dashboard
+    if 'username' in session:
+        return redirect(url_for('dashboard'))
+    
+    return render_template_string(HTML_SIGNIN)
+
+@app.route("/logout", methods=["GET"])
+def logout():
+    """Logout and clear session."""
+    session.pop('username', None)
+    return redirect(url_for('signin'))
+
+@app.route("/dashboard", methods=["GET"])
+def dashboard():
+    """Dashboard with options for realtime or dataset pairs."""
+    if 'username' not in session:
+        return redirect(url_for('signin'))
+    
+    username = session.get('username', 'User')
+    return render_template_string(HTML_DASHBOARD, username=username)
+
+@app.route("/realtime", methods=["GET"])
+def realtime():
+    """Real-time try-on page."""
+    if 'username' not in session:
+        return redirect(url_for('signin'))
+    
+    return render_template_string(HTML_REALTIME)
+
+@app.route("/video_feed")
+def video_feed():
+    """Video streaming route for real-time camera feed."""
+    if 'username' not in session:
+        return "Unauthorized", 401
+    
+    def generate():
+        rt_system = get_realtime_system()
+        if rt_system is None:
+            # Return error frame
+            frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.putText(frame, "Realtime system not available", (50, 240),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            _, buffer = cv2.imencode('.jpg', frame)
+            frame_bytes = buffer.tobytes()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+            return
+        
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.putText(frame, "Camera not available", (50, 240),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            _, buffer = cv2.imencode('.jpg', frame)
+            frame_bytes = buffer.tobytes()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+            cap.release()
+            return
+        
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                # Process frame with realtime system
+                display_frame, info = rt_system.process_frame(frame)
+                
+                # Encode frame as JPEG
+                _, buffer = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                frame_bytes = buffer.tobytes()
+                
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+        finally:
+            cap.release()
+    
+    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route("/realtime/next_shirt", methods=["POST"])
+def realtime_next_shirt():
+    """Switch to next shirt."""
+    if 'username' not in session:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    rt_system = get_realtime_system()
+    if rt_system:
+        rt_system.next_shirt()
+    return jsonify({"status": "ok"})
+
+@app.route("/realtime/prev_shirt", methods=["POST"])
+def realtime_prev_shirt():
+    """Switch to previous shirt."""
+    if 'username' not in session:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    rt_system = get_realtime_system()
+    if rt_system:
+        rt_system.prev_shirt()
+    return jsonify({"status": "ok"})
+
+@app.route("/realtime/set_shirt/<int:index>", methods=["POST"])
+def realtime_set_shirt(index):
+    """Set specific shirt index."""
+    if 'username' not in session:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    rt_system = get_realtime_system()
+    if rt_system:
+        rt_system.set_shirt_index(index)
+    return jsonify({"status": "ok"})
+
+@app.route("/realtime/info", methods=["GET"])
+def realtime_info():
+    """Get current realtime system info."""
+    if 'username' not in session:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    rt_system = get_realtime_system()
+    if rt_system:
+        return jsonify({
+            "shirt_count": len(rt_system.shirts),
+            "current_shirt": rt_system.target_shirt_index,
+            "shirt_name": rt_system.shirt_names[rt_system.target_shirt_index] 
+                         if rt_system.target_shirt_index < len(rt_system.shirt_names) 
+                         else "Unknown"
+        })
+    return jsonify({"shirt_count": 0, "current_shirt": 0, "shirt_name": "No shirts available"})
+
+@app.route("/realtime/shirt_list", methods=["GET"])
+def realtime_shirt_list():
+    """Get list of available shirt filenames."""
+    if 'username' not in session:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    rt_system = get_realtime_system()
+    if rt_system and rt_system.shirt_files:
+        return jsonify({"shirts": rt_system.shirt_files})
+    return jsonify({"shirts": []})
 
 
 @app.route("/predict", methods=["GET", "POST"])
 def predict():
+    """Dataset pairs try-on page."""
+    if 'username' not in session:
+        return redirect(url_for('signin'))
+    
     context = base_context()
 
     if request.method == "GET":
@@ -2345,7 +4104,10 @@ def predict():
             <style>
                 body {{
                     font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    background: #0a0a0a;
+                    background-image: 
+                        radial-gradient(at 20% 30%, #1a1a1a 0%, transparent 50%),
+                        radial-gradient(at 80% 70%, #151515 0%, transparent 50%);
                     min-height: 100vh;
                     display: flex;
                     align-items: center;
@@ -2353,22 +4115,38 @@ def predict():
                     padding: 20px;
                 }}
                 .error-container {{
-                    background: white;
+                    background: linear-gradient(145deg, #1a1a1a 0%, #0f0f0f 100%);
                     padding: 40px;
                     border-radius: 20px;
                     max-width: 600px;
-                    box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+                    box-shadow: 0 20px 60px rgba(0,0,0,0.8),
+                                0 0 0 1px rgba(255, 255, 255, 0.1);
+                    border: 1px solid rgba(255, 255, 255, 0.15);
                     text-align: center;
                 }}
-                h1 {{ color: #c33; margin-bottom: 20px; }}
-                p {{ color: #666; margin-bottom: 30px; }}
+                h1 {{ 
+                    color: #ff6b6b; 
+                    margin-bottom: 20px;
+                    background: linear-gradient(135deg, #ff6b6b 0%, #ff8787 100%);
+                    -webkit-background-clip: text;
+                    -webkit-text-fill-color: transparent;
+                    background-clip: text;
+                }}
+                p {{ color: #a0a0a0; margin-bottom: 30px; }}
                 .btn {{
                     display: inline-block;
                     padding: 12px 30px;
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    color: white;
+                    background: linear-gradient(135deg, #ffffff 0%, #e0e0e0 100%);
+                    color: #0a0a0a;
                     text-decoration: none;
                     border-radius: 25px;
+                    font-weight: 600;
+                    box-shadow: 0 4px 15px rgba(255, 255, 255, 0.2);
+                    transition: all 0.3s;
+                }}
+                .btn:hover {{
+                    transform: translateY(-2px);
+                    box-shadow: 0 6px 20px rgba(255, 255, 255, 0.3);
                 }}
             </style>
         </head>
@@ -2384,6 +4162,293 @@ def predict():
         return error_html, 500
 
 
+@app.route("/custom", methods=["GET", "POST"])
+def custom():
+    """Custom upload page with KlingAI try-on."""
+    if 'username' not in session:
+        return redirect(url_for('signin'))
+    
+    if request.method == "GET":
+        return render_template_string(HTML_CUSTOM)
+    
+    # Handle POST request
+    try:
+        if "person_image" not in request.files or "cloth_image" not in request.files:
+            error_html = f"""
+            <!doctype html>
+            <html>
+            <head>
+                <meta charset="UTF-8">
+                <title>Error - Virtual Dressing Room</title>
+                <style>
+                    body {{
+                        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                        background: #0a0a0a;
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        min-height: 100vh;
+                        padding: 20px;
+                    }}
+                    .error-container {{
+                        background: linear-gradient(145deg, #1a1a1a 0%, #0f0f0f 100%);
+                        padding: 40px;
+                        border-radius: 20px;
+                        max-width: 600px;
+                        text-align: center;
+                        border: 1px solid rgba(255, 255, 255, 0.15);
+                    }}
+                    h1 {{ 
+                        color: #ff6b6b; 
+                        margin-bottom: 20px;
+                    }}
+                    p {{ color: #a0a0a0; margin-bottom: 30px; }}
+                    .btn {{
+                        display: inline-block;
+                        padding: 12px 30px;
+                        background: linear-gradient(135deg, #ffffff 0%, #e0e0e0 100%);
+                        color: #0a0a0a;
+                        text-decoration: none;
+                        border-radius: 25px;
+                        font-weight: 600;
+                    }}
+                </style>
+            </head>
+            <body>
+                <div class="error-container">
+                    <h1>Error</h1>
+                    <p>Please upload both person and clothing images.</p>
+                    <a href="/custom" class="btn">Go Back</a>
+                </div>
+            </body>
+            </html>
+            """
+            return error_html, 400
+        
+        person_file = request.files["person_image"]
+        cloth_file = request.files["cloth_image"]
+        
+        if person_file.filename == "" or cloth_file.filename == "":
+            error_html = f"""
+            <!doctype html>
+            <html>
+            <head>
+                <meta charset="UTF-8">
+                <title>Error - Virtual Dressing Room</title>
+                <style>
+                    body {{
+                        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                        background: #0a0a0a;
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        min-height: 100vh;
+                        padding: 20px;
+                    }}
+                    .error-container {{
+                        background: linear-gradient(145deg, #1a1a1a 0%, #0f0f0f 100%);
+                        padding: 40px;
+                        border-radius: 20px;
+                        max-width: 600px;
+                        text-align: center;
+                        border: 1px solid rgba(255, 255, 255, 0.15);
+                    }}
+                    h1 {{ 
+                        color: #ff6b6b; 
+                        margin-bottom: 20px;
+                    }}
+                    p {{ color: #a0a0a0; margin-bottom: 30px; }}
+                    .btn {{
+                        display: inline-block;
+                        padding: 12px 30px;
+                        background: linear-gradient(135deg, #ffffff 0%, #e0e0e0 100%);
+                        color: #0a0a0a;
+                        text-decoration: none;
+                        border-radius: 25px;
+                        font-weight: 600;
+                    }}
+                </style>
+            </head>
+            <body>
+                <div class="error-container">
+                    <h1>Error</h1>
+                    <p>Empty filename supplied for upload.</p>
+                    <a href="/custom" class="btn">Go Back</a>
+                </div>
+            </body>
+            </html>
+            """
+            return error_html, 400
+        
+        # Check if KlingAI is available
+        adapter = get_klingai_adapter()
+        if adapter is None:
+            error_html = f"""
+            <!doctype html>
+            <html>
+            <head>
+                <meta charset="UTF-8">
+                <title>Error - Virtual Dressing Room</title>
+                <style>
+                    body {{
+                        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                        background: #0a0a0a;
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        min-height: 100vh;
+                        padding: 20px;
+                    }}
+                    .error-container {{
+                        background: linear-gradient(145deg, #1a1a1a 0%, #0f0f0f 100%);
+                        padding: 40px;
+                        border-radius: 20px;
+                        max-width: 600px;
+                        text-align: center;
+                        border: 1px solid rgba(255, 255, 255, 0.15);
+                    }}
+                    h1 {{ 
+                        color: #ff6b6b; 
+                        margin-bottom: 20px;
+                    }}
+                    p {{ color: #a0a0a0; margin-bottom: 30px; }}
+                    .btn {{
+                        display: inline-block;
+                        padding: 12px 30px;
+                        background: linear-gradient(135deg, #ffffff 0%, #e0e0e0 100%);
+                        color: #0a0a0a;
+                        text-decoration: none;
+                        border-radius: 25px;
+                        font-weight: 600;
+                    }}
+                </style>
+            </head>
+            <body>
+                <div class="error-container">
+                    <h1>KlingAI Not Available</h1>
+                    <p>KlingAI adapter is not configured. Please set KLINGAI_API_KEY and KLINGAI_SECRET_KEY environment variables.</p>
+                    <a href="/custom" class="btn">Go Back</a>
+                </div>
+            </body>
+            </html>
+            """
+            return error_html, 500
+        
+        # Save uploaded files
+        uid = uuid.uuid4().hex
+        person_filename = secure_filename(person_file.filename or f"person_{uid}.jpg")
+        cloth_filename = secure_filename(cloth_file.filename or f"cloth_{uid}.jpg")
+        
+        person_path = os.path.join(UPLOAD_DIR, f"person_{uid}.jpg")
+        cloth_path = os.path.join(UPLOAD_DIR, f"cloth_{uid}.jpg")
+        
+        person_file.save(person_path)
+        cloth_file.save(cloth_path)
+        
+        # Get model version from form (default to v1-5)
+        model_version = request.form.get("model_version", "kolors-virtual-try-on-v1-5")
+        
+        # Validate model version
+        valid_models = ["kolors-virtual-try-on-v1", "kolors-virtual-try-on-v1-5"]
+        if model_version not in valid_models:
+            model_version = "kolors-virtual-try-on-v1-5"  # Default to enhanced version
+            print(f"[WARNING] Invalid model version, using default: {model_version}")
+        
+        # Generate try-on using KlingAI
+        print(f"[info] Generating try-on with KlingAI for person: {person_path}, cloth: {cloth_path}, model: {model_version}")
+        images = adapter.generate_and_decode(
+            source_image=person_path,
+            reference_image=cloth_path,
+            model=model_version
+        )
+        
+        # Save results
+        result_paths = []
+        for idx, image in enumerate(images):
+            result_filename = f"result_{uid}_{idx}.png"
+            result_path = os.path.join(OUTPUT_DIR, result_filename)
+            image.save(result_path)
+            result_paths.append(result_path)
+            print(f"[info] Saved result {idx} to {result_path}")
+        
+        # Use the first result as the main result
+        main_result_path = result_paths[0] if result_paths else None
+        
+        if main_result_path is None:
+            raise ValueError("No results generated from KlingAI")
+        
+        # Prepare result context
+        result_context = {
+            "result_url": to_url(main_result_path),
+            "person_url": to_url(person_path),
+            "cloth_url": to_url(cloth_path),
+        }
+        
+        return render_template_string(HTML_CUSTOM_RESULT, **result_context)
+        
+    except Exception as exc:
+        error_html = f"""
+        <!doctype html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>Error - Virtual Dressing Room</title>
+            <style>
+                body {{
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                    background: #0a0a0a;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    min-height: 100vh;
+                    padding: 20px;
+                }}
+                .error-container {{
+                    background: linear-gradient(145deg, #1a1a1a 0%, #0f0f0f 100%);
+                    padding: 40px;
+                    border-radius: 20px;
+                    max-width: 600px;
+                    text-align: center;
+                    border: 1px solid rgba(255, 255, 255, 0.15);
+                }}
+                h1 {{ 
+                    color: #ff6b6b; 
+                    margin-bottom: 20px;
+                }}
+                p {{ color: #a0a0a0; margin-bottom: 30px; }}
+                .btn {{
+                    display: inline-block;
+                    padding: 12px 30px;
+                    background: linear-gradient(135deg, #ffffff 0%, #e0e0e0 100%);
+                    color: #0a0a0a;
+                    text-decoration: none;
+                    border-radius: 25px;
+                    font-weight: 600;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="error-container">
+                <h1>Error</h1>
+                <p>{str(exc)}</p>
+                <a href="/custom" class="btn">Go Back</a>
+            </div>
+        </body>
+        </html>
+        """
+        print(f"[ERROR] Custom upload error: {exc}\n{traceback.format_exc()}")
+        return error_html, 500
+
+
+# if __name__ == "__main__":
+#     print(f"[info] VITON Flask app running on device: {device}")
+#     app.run(host="0.0.0.0", port=5000, debug=True)
+
 if __name__ == "__main__":
-    print(f"[info] VITON Flask app running on device: {device}")
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(
+        host="0.0.0.0",
+        port=5000,
+        debug=False,
+        use_reloader=False,
+        threaded=False
+    )
