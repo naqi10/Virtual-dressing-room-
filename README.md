@@ -2,11 +2,13 @@
 
 ## Overview
 
-The **Virtual Dressing Room** is an AI-powered virtual try-on system that allows users to visualize how different clothing items would look on a person without physically wearing them. This project is designed as a **research-oriented, practical implementation** that combines dataset-based virtual try-on pipelines with real-time pose estimation and an external AI service for high-quality custom uploads.
+This project was selected and developed as my **Final Year Project (FYP)**, with a strong emphasis on research, experimentation, and technical evaluation of different virtual try-on methodologies under real-world constraints such as limited computational resources, deployment feasibility, and system scalability.
 
-The main goal of this project is not to claim a single perfect solution, but to **explore, compare, and integrate multiple virtual try-on approaches**from dataset-driven pipelines to real-time pose-based inference and API-powered high-quality rendering while keeping the system runnable on **CPU-only environments**.
+The Virtual Dressing Room is an AI-powered virtual try-on system that allows users to visualize how different clothing items would look on a person without physically wearing them. This project is designed as a research-oriented and practical implementation that combines dataset-based virtual try-on pipelines with real-time pose estimation and an external AI service for high-quality custom uploads.
 
-This project has been implemented by learning from and adapting ideas from well-known works and datasets such as **VITON-HD**, **Zalando-HD (resized)**, and pose-estimation-based virtual try-on techniques, and then combining them into a single, structured system.
+The main goal of this project is not to claim a single perfect solution, but to explore, compare, and integrate multiple virtual try-on approaches ranging from dataset-driven pipelines to real-time pose-based inference and API-powered high-quality rendering while keeping the overall system runnable in CPU-only environments.
+
+The implementation is based on learning from and adapting ideas from well-known works and datasets such as VITON-HD, Zalando-HD (resized), and pose-estimation-based virtual try-on techniques, which are then unified into a single, well-structured and modular system.
 
 ---
 
